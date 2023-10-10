@@ -1,0 +1,65 @@
+name: Inject Cache
+description: "Injects the cached data into the docker build(x|kit) process"
+inputs:
+  cache-source:
+    default: cache
+    description: "Where the cache is stored in the calling workspace. Default: `cache`"
+  scratch-dir:
+    default: scratch
+    description: "Where the action is stores some temporary files for its processing. Default: `scratch`"
+  mounts:
+    description: Docker build cache mounts list
+    required: true
+  bucket:
+    description: Bucket name
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Clean Directories
+      shell: bash
+      run: |
+        rm -Rf ${{ inputs.scratch-dir }} && mkdir -p ${{ inputs.scratch-dir }} ${{ inputs.cache-source }}
+
+    - name: Prepare Timestamp for Layer Cache Busting
+      shell: bash
+      run: |
+        date --iso=ns | tee ${{ inputs.cache-source }}/buildstamp
+
+    - name: Prepare list of cache mounts for Dancefile
+      uses: actions/github-script@v6
+      id: mounts
+      with:
+        script: |
+          const mountIds = `${{ inputs.mounts }}`.split(/[\r\n,]+/)
+            .map((mount) => mount.trim())
+            .filter((mount) => mount.length > 0);
+          
+          const cacheMountArgs = mountIds.map((mount) => (
+            `--mount=type=cache,sharing=shared,id=${mount},target=/cache-mounts/${mount}`
+          )).join(' ');
+          
+          const s3commands = mountIds.map((mount) => (
+            `aws s3 sync --no-follow-symlinks --quiet s3://${{inputs.bucket}}/cache-mounts/${mount} /cache-mounts/${mount}`
+          )).join('\n');
+
+          core.setOutput('cacheMountArgs', cacheMountArgs);
+          core.setOutput('s3commands', s3commands);
+
+    - name: Inject cache data into buildx context
+      shell: bash
+      run: |
+        docker build ${{ inputs.cache-source }} --file - <<EOF
+        FROM amazon/aws-cli:2.13.17
+        COPY buildstamp buildstamp
+        RUN ${{ steps.mounts.outputs.cacheMountArgs }} <<EOT
+            echo -e '${{ steps.mounts.outputs.s3commands }}' | sh && \
+            chmod 777 -R /cache-mounts || true
+        EOT
+        EOF
+
+    - name: Clean Directories
+      shell: bash
+      run: |
+        sudo rm -rf ${{ inputs.cache-source }}
